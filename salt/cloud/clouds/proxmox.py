@@ -26,17 +26,13 @@ Set up the cloud configuration at ``/etc/salt/cloud.providers`` or
 :depends: IPy >= 0.81
 """
 
-# Import python libs
 
 import logging
 import pprint
 import re
 import time
 
-# Import salt cloud libs
 import salt.config as config
-
-# Import salt libs
 import salt.utils.cloud
 import salt.utils.json
 from salt.exceptions import (
@@ -44,8 +40,6 @@ from salt.exceptions import (
     SaltCloudExecutionTimeout,
     SaltCloudSystemExit,
 )
-
-# Import 3rd-party Libs
 from salt.ext.six.moves import range
 
 try:
@@ -668,7 +662,9 @@ def create(vm_):
     nodeType = data["technology"]  # VM tech (Qemu / OpenVZ)
 
     # Determine which IP to use in order of preference:
-    if "ip_address" in vm_:
+    if "ip_address" in data:
+        ip_address = str(data["ip_address"])
+    elif "ip_address" in vm_:
         ip_address = str(vm_["ip_address"])
     elif "public_ips" in data:
         ip_address = str(data["public_ips"][0])  # first IP
@@ -778,19 +774,116 @@ def _get_properties(path="", method="GET", forced_params=None):
     return parameters
 
 
+def _make_rootfs(vm_, VMID):
+    """
+    Create a suitable rootfs for use by the VM/container
+
+    Proxmox uses a storage naming convention based on storage type and image type. We
+    can use this to determine storage names to support rootfs sizing and mount points
+
+    Supported combinations are:
+    dir:<VMID>/vm-<VMID>-disk-0.raw
+    lvm:vm-<VMID>-disk-0
+    zfs:vm-<VMID>-disk-0            -- QEMU VM's
+    zfs:subvol-<VMID>-disk-0        -- LXC containers
+
+    #TODO: Check if other storage backends require specifics - eg Gluster, Ceph etc.
+
+    """
+
+    if "disk" in vm_:
+        if "storage" not in vm_:
+            SaltCloudExecutionFailure(
+                "Requesting a disk size, but no storage supplied."
+            )
+        else:
+            host_name = vm_["host"]
+            storage_name = vm_["storage"]
+            storage_size = vm_["disk"]
+            storage_info = query("get", "nodes/{}/storage".format(host_name))
+
+            storage_type = None
+            for stor in storage_info:
+                if stor["storage"] == storage_name:
+                    if (
+                        "images" in stor["content"]
+                    ):  # need images type to store VM/CT images
+                        storage_type = stor["type"]
+
+            newstor = {}
+            if storage_type == "dir":
+                newstor = {
+                    "filename": "vm-{}-disk-0.raw".format(VMID),
+                    "vmid": VMID,
+                    "size": storage_size,
+                    "format": "raw",
+                }
+
+            elif storage_type == "zfspool":
+                if vm_["technology"] == "qemu":
+                    newstor = {
+                        "filename": "vm-{}-disk-0.raw".format(VMID),
+                        "vmid": VMID,
+                        "size": storage_size,
+                        "format": "raw",
+                    }
+
+                elif vm_["technology"] == "lxc":
+                    newstor = {
+                        "filename": "subvol-{}-disk-0".format(VMID),
+                        "vmid": VMID,
+                        "size": storage_size,
+                        "format": "subvol",
+                    }
+                else:
+                    SaltCloudExecutionFailure(
+                        "UNsupported techonology for storage '{}'".format(storage_name)
+                    )
+            elif storage_type == "lvm":
+                newstor = {
+                    "filename": "vm-{}-disk-0".format(VMID),
+                    "vmid": VMID,
+                    "size": storage_size,
+                    "format": "raw",
+                }
+            else:
+                SaltCloudExecutionFailure(
+                    "Storage '{}' on node '{}' is invalid for this VM".format(
+                        storage_name, host_name
+                    )
+                )
+
+            if newstor:
+                try:
+                    query(
+                        "post",
+                        "nodes/{}/storage/{}/content".format(host_name, storage_name),
+                        newstor,
+                    )
+                    return "{}:{}".format(storage_name, newstor["filename"])
+                except Exception as e:  # pylint: disable=broad-except
+                    log.error(e)
+                    SaltCloudExecutionFailure(
+                        "Failed to create volume '{}' on storage '{}'".format(
+                            newstor["filename"], storage_name
+                        )
+                    )
+
+
 def create_node(vm_, newid):
     """
     Build and submit the requestdata to create a new node
     """
     newnode = {}
 
+    # Default virt tech if none is given. LXC and OVZ are version sensitive, qemu is not
     if "technology" not in vm_:
-        vm_["technology"] = "openvz"  # default virt tech if none is given
+        vm_["technology"] = "qemu"
 
     if vm_["technology"] not in ["qemu", "openvz", "lxc"]:
         # Wrong VM type given
         log.error(
-            "Wrong VM type. Valid options are: qemu, openvz (proxmox3) or lxc (proxmox4)"
+            "Wrong VM type. Valid options are: qemu, openvz (proxmox3) or lxc (proxmox4+)"
         )
         raise SaltCloudExecutionFailure
 
@@ -838,20 +931,27 @@ def create_node(vm_, newid):
         newnode["ostemplate"] = vm_["image"]
 
         static_props = (
-            "cpuunits",
-            "cpulimit",
-            "rootfs",
+            "arch",
             "cores",
+            "cpulimit",
+            "cpuunits",
             "description",
+            "features",
             "memory",
-            "onboot",
-            "net0",
-            "password",
+            "mp0",
             "nameserver",
-            "swap",
-            "storage",
+            "net0",
+            "onboot",
+            "password",
             "rootfs",
+            "searchdomain",
+            "storage",
+            "swap",
+            "tags",
+            "timezone",
+            "unprivileged",
         )
+
         for prop in _get_properties("/nodes/{node}/lxc", "POST", static_props):
             if prop in vm_:  # if the property is set, use it for the VM request
                 newnode[prop] = vm_[prop]
@@ -859,11 +959,9 @@ def create_node(vm_, newid):
         if "pubkey" in vm_:
             newnode["ssh-public-keys"] = vm_["pubkey"]
 
-        # inform user the "disk" option is not supported for LXC hosts
         if "disk" in vm_:
-            log.warning(
-                'The "disk" option is not supported for LXC hosts and was ignored'
-            )
+            diskname = _make_rootfs(vm_, newid)
+            newnode["rootfs"] = diskname + ",size=" + vm_["disk"]
 
         # LXC specific network config
         # OpenVZ allowed specifying IP and gateway. To ease migration from
